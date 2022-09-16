@@ -42,7 +42,6 @@ pub fn open(device: &str, config: &Config) -> Result<Cap>{
 
 
 impl Cap {
-
     pub fn datalink(&self) -> i32 {
         unsafe { pcap_sys::pcap_datalink(self.handle) }
     }

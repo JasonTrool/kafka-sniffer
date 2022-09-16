@@ -19,7 +19,8 @@ impl CorrelationMap {
     }
 
     pub fn get_and_remove(&mut self, key: i32) -> Option<Vec<i16>> {
-        let s = match self.storage.lock().unwrap().get(&key) {
+        let mut storage = self.storage.lock().unwrap();
+        let s = match storage.remove(&key) {
             Some(v) => Some(v.clone()),
             None => None,
         };
