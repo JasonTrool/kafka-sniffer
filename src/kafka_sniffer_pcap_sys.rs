@@ -1,6 +1,8 @@
 use anyhow::{Result};
 use std::ffi::CString;
 use std::ffi::CStr;
+use std::mem;
+
 
 pub struct Cap {
     handle: *mut pcap_sys::pcap,
@@ -71,6 +73,30 @@ impl Cap {
             _ => unreachable!(),
         }
     }
+
+    pub unsafe fn set_filter(&self, filter: &str) {
+        // compile a filter code
+        let mut bpf_program: pcap_sys::bpf_program = mem::zeroed();
+        let status = pcap_sys::pcap_compile(self.handle, &mut bpf_program, filter.as_ptr() as *const i8, 1, pcap_sys::PCAP_NETMASK_UNKNOWN);
+        if status != 0 {
+            let err = self.get_error();
+            eprintln!("at set_filter: {}", err);
+        }
+
+        // apply filter
+        let status = pcap_sys::pcap_setfilter(self.handle, &mut bpf_program);
+        if status != 0 {
+            let err = self.get_error();
+            eprintln!("at set_filter: {}", err);
+        }
+    }
+
+    fn get_error(&self) -> String {
+        let mut errbuf = [0; pcap_sys::PCAP_ERRBUF_SIZE as usize];
+        let err = unsafe { pcap_sys::pcap_geterr(self.handle) };
+        let err = unsafe { CStr::from_ptr(err) };
+        err.to_str().unwrap().to_owned()
+    }
 }
 
 // releasing pcap resources upon drop
@@ -93,6 +119,7 @@ pub fn runner() {
     };
 
     let mut cap = open(iface.as_str(), &conf).expect("unknown interface!!!");
+    cap.set_filter("tcp port 9092")
     while let Ok(Some(packet)) = cap.next_packet() {
         println!("packet recvd: {:?}", packet.data);
     }
