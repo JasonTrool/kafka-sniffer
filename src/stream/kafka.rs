@@ -10,7 +10,7 @@ impl CorrelationMap {
     pub fn new() -> Self {
         CorrelationMap { 
             storage: Arc::new(Mutex::new(HashMap::new()))
-         }
+        }
     }
 
     pub fn add(&mut self, key: i32, value: &Vec<i16>) {
