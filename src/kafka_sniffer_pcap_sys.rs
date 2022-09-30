@@ -1,14 +1,63 @@
 use anyhow::{Result};
 use kafka_protocol::protocol::buf::ByteBuf;
+use lazy_static::lazy_static;
+use std::f32::consts::E;
 use std::ffi::CString;
 use std::ffi::CStr;
 use std::mem;
-use kafka_protocol::messages::{RequestHeader, ApiVersionsRequest, ApiKey, RequestKind};
+use kafka_protocol::messages::{RequestHeader, ApiKey};
 use kafka_protocol::messages;
-use kafka_protocol::protocol::{Encodable, Decodable, StrBytes};
-use bytes::{BytesMut, Buf};
+use kafka_protocol::protocol::{Decodable};
+use bytes::{BytesMut, Bytes, Buf};
+use std::collections::HashMap;
 use std::{thread, time};
-use serde::{Deserializer, Deserialize};
+use std::sync::{Mutex};
+use std::error;
+use std::time::{SystemTime, Duration};
+use std::fmt;
+use std::fmt::Formatter;
+
+use crate::stream::kafka::{CorrelationMap};
+
+const MAX_RESPONSE_SIZE: i32 = 10 * 1024 * 1024; // 10MB
+const MIN_RESPONSE_SIZE: i32 = 5;
+
+lazy_static! {
+    static ref CORRELATION_MAP: Mutex<CorrelationMap> = Mutex::new(CorrelationMap::new());
+}
+
+type KafkaSnifferResult<T> = std::result::Result<T, Box<dyn error::Error>>;
+
+#[derive(Debug, Clone)]
+pub struct InvalidLengthValueError;
+
+impl fmt::Display for InvalidLengthValueError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid value of length")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FailedToGetKeyAndVersionError;
+
+impl fmt::Display for FailedToGetKeyAndVersionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to get key and version using correlationID")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnsupportedBodyWithKeyError;
+
+impl fmt::Display for UnsupportedBodyWithKeyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unsupported body with key")
+    }
+}
+
+impl error::Error for InvalidLengthValueError {} 
+impl error::Error for FailedToGetKeyAndVersionError {}
+impl error::Error for UnsupportedBodyWithKeyError {}
 
 pub struct Cap {
     handle: *mut pcap_sys::pcap,
@@ -17,6 +66,192 @@ pub struct Cap {
 pub struct Config {
     pub promisc: bool,
     pub immediate_mode: bool,
+}
+
+pub struct KafkaResponse {
+    pub key: i16,
+    pub version: i16,
+    pub body_length: i32,
+    pub correlation_id: i32,
+    pub client_id: Option<String>,
+    pub body: Box<dyn ProtocolBody>,
+    pub use_prepared_key_version: bool,
+}
+
+impl KafkaResponse {
+    pub fn decode<T: ByteBuf>(&self, data: &mut T, version: i16) -> KafkaSnifferResult<Self> {
+        let length = data.peek_bytes(0..4).get_i32();
+        let correlation_id = data.peek_bytes(4..8).get_i32();
+        if length < MIN_RESPONSE_SIZE || length > MAX_RESPONSE_SIZE {
+            return Err(InvalidLengthValueError.into());
+        }
+    
+        // use correlation map to pull key and version out
+        let mut key: i16;
+        let mut version: i16;
+        if let Some(value) = CORRELATION_MAP.lock().unwrap().get_and_remove(correlation_id) {
+            key = value[0];
+            version = value[1];
+        } else {
+            return Err(FailedToGetKeyAndVersionError.into());
+        }
+        
+        let remaining = data.peek_bytes(8..4+length as usize).to_vec();
+
+        todo!()
+        // if key == 0 {
+        //     self.body = Box::new(ProduceResponse::decode(&Bytes::from(remaining), version).unwrap());
+        // } else if key == 1 {
+        //     //self.body = Box::new(FetchResponse::decode())
+        // }
+
+        // Ok(KafkaResponse {
+        //     key: key,
+        //     version: version,
+        //     body_length: length,
+        //     correlation_id,
+        //     client_id: None,
+        //     body: 
+        //     use_prepared_key_version: true,
+        // })
+    }
+
+    fn allocate_response_body(&self, key: i16, version: i16) -> Option<Box<dyn ProtocolBody>> {
+        match key {
+            0 => Some(Box::new(ProduceResponse::new())),
+            1 => Some(Box::new(FetchResponse::new())),
+            _ => None,
+        }
+    }
+}
+
+
+pub trait ProtocolBody{
+    fn key(&self) -> i16;
+    fn version(&self) -> i16;
+}
+
+#[derive(Debug)]
+pub struct ProduceResponseBlock {
+    pub err: i16,
+    pub offset: i64,
+    pub timestamp: SystemTime,
+    pub start_offset: i64,
+}
+
+#[derive(Debug)]
+pub struct ProduceResponse {
+    pub blocks: HashMap<String, HashMap<i32, Option<ProduceResponseBlock>>>,
+    pub version: i16,
+    pub throttle_time: Duration,
+}
+
+impl ProduceResponse {
+    pub fn new() -> Self {
+        ProduceResponse {
+            version: 0,
+            throttle_time: Duration::default(),
+            blocks: HashMap::new(),
+        }
+    }
+
+    pub fn decode<T: ByteBuf>(data: &T, version: i16) -> KafkaSnifferResult<ProduceResponse> {
+        let mut response = ProduceResponse::new();
+        response.version = version; 
+        todo!()
+    }
+}
+
+
+impl ProtocolBody for ProduceResponse {
+    fn key(&self) -> i16 {
+        0
+    }
+
+    fn version(&self) -> i16 {
+        self.version
+    }
+
+}
+
+#[derive(Debug)]
+pub struct FetchResponse {
+    pub throttle_time: Duration,
+    pub error_code: i16,
+    pub session_id: i32,
+    pub version: i16,
+    pub log_append_time: bool,
+    pub timestamp: SystemTime,
+}
+
+impl FetchResponse {
+    pub fn new() -> Self {
+        FetchResponse {
+            throttle_time: Duration::default(),
+            error_code: 0,
+            session_id: 0,
+            version: 0,
+            log_append_time: false,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    pub fn decode<T: ByteBuf>(data: &T, version: i16) -> KafkaSnifferResult<FetchResponse> {
+        todo!()
+    }
+}
+
+impl ProtocolBody for FetchResponse {
+    fn key(&self) -> i16 {
+        1
+    }
+    
+    fn version(&self) -> i16 {
+        self.version
+    }
+}
+
+#[derive(Debug)]
+pub struct Message {
+    pub codec: i8, 
+    pub compression_level: i32,
+    pub log_append_time: bool,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub set: MessageSet,
+    pub version: i8,
+    pub timestamp: SystemTime,
+}
+
+#[derive(Debug)]
+pub struct MessageBlock {
+    pub offset: i64,
+    pub message: Option<Message>
+}
+
+#[derive(Debug)]
+pub struct MessageSet {
+    partial_trailing_message: bool,
+    overflow_message: bool,
+    messages: Vec<MessageBlock>,
+}
+
+#[derive(Debug)]
+pub struct RecordBatch {
+}
+
+pub enum Records {
+    MsgSet(MessageSet),
+    RecordBatch(RecordBatch),
+}
+
+#[derive(Debug)]
+pub struct ProduceRequest {
+    pub transactional_id: Option<String>,
+    pub required_acks: i16,
+    pub timeout: i32,
+    pub version: i16,
+    pub records: HashMap<String, HashMap<i32, RecordBatch>>,
 }
 
 pub fn open(device: &str, config: &Config) -> Result<Cap>{
@@ -130,28 +365,6 @@ pub fn runner() {
     let mut cap = open(iface.as_str(), &conf).expect("unknown interface!!!");
     unsafe { cap.set_filter("tcp and port 9092") };
     let duration = time::Duration::from_secs(1);
-    let data = vec![0x2, 0x0, 0x0, 0x0, 0x45, 0x0,
-                    0x0, 0x70, 0x0, 0x0, 0x40, 0x0,
-                    0x40, 0x06, 0x0, 0x0, 0xc0, 0xa8,
-                    0x00, 0xc7, 0xc0, 0xa8, 0x00, 0xc7,
-                    0xdf, 0xf5, 0x23, 0x84, 0x19, 0x36,
-                    0xe1, 0x77, 0xdf, 0x6c, 0x7e, 0x5a,
-                    0x80, 0x18, 0x95, 0xb4, 0x83, 0x41,
-                    0x00, 0x00, 0x01, 0x01, 0x08, 0x0a,
-                    0xde, 0xa1, 0xfc, 0x6d, 0x24, 0x2c,
-                    0x5f, 0x36, 0x00, 0x00, 0x00, 0x38,
-                    0x00, 0x01, 0x00, 0x0d, 0x00, 0x00,
-                    0x07, 0xa6, 0x00, 0x10, 0x63, 0x6f,
-                    0x6e, 0x73, 0x6f, 0x6c, 0x65, 0x2d,
-                    0x63, 0x6f, 0x6e, 0x73, 0x75, 0x6d,
-                    0x65, 0x72, 0x00, 0xff, 0xff, 0xff,
-                    0xff, 0x00, 0x00, 0x01, 0xf4, 0x00,
-                    0x00, 0x00, 0x01, 0x03, 0x20, 0x00,
-                    0x00, 0x00, 0x5e, 0xcc, 0x4b, 0x6a,
-                    0x00, 0x00, 0x06, 0x80, 0x01, 0x01,
-                    0x01, 0x00];
-
-    decode_packet(&data);
     while let Ok(Some(packet)) = cap.next_packet() {
         decode_packet(&packet.data);
         thread::sleep(duration);
@@ -161,7 +374,7 @@ pub fn runner() {
 fn decode_packet(data: &[u8]) {
     let mut buf = BytesMut::from(data);
     let family = buf.peek_bytes(0..4).get_i16_le();
-    println!("we're like a family! NO! Brothers and sisters => {}", family);
+    println!("family => {}", family);
     let ihl = buf.peek_bytes(4..5).get_i8();
     // get the size of a header
     let size = ((ihl & 0x0F) * 4) as usize;
@@ -176,36 +389,51 @@ fn decode_packet(data: &[u8]) {
     }
 
     let tcp_header = buf[size+4.. ].to_vec();
-    let mut kafka_data = match pktparse::tcp::parse_tcp_header(tcp_header.as_slice()) {
+    let (mut kafka_data, tcp_header) = match pktparse::tcp::parse_tcp_header(tcp_header.as_slice()) {
         Ok((data, header)) => {
             println!("source port => {}", header.source_port);
             println!("dest port => {}", header.dest_port);
-            data
+            (data, header)
         }
         Err(_) => {
             panic!("failed to parse tcp header");
         }
     };
 
+    // how do we distinguish between response and request?
+    // right, we look at the source and destination ports, if the former
+    // evaluates to 9092, then we know for sure it's a response.
 
-    let message_length = kafka_data.peek_bytes(0..4).get_i32();
-    let api_key = ApiKey::try_from(kafka_data.peek_bytes(4..6).get_i16()).unwrap();
-    let version = kafka_data.peek_bytes(6..8).get_i16();
-    match api_key {
-        ApiKey::FetchKey => {
-            let mut fetch_req_raw = kafka_data.peek_bytes(8usize..message_length as usize);
-            let req = kafka_protocol::messages::FetchRequest::decode(&mut fetch_req_raw, version).unwrap();
-            for topic in &req.topics {
-                println!("{}", topic.topic.to_string())
-            }
-        }
-        _ => {
-            println!("unknown one")
-        }
+    let raw = kafka_data.to_vec();
+    println!("{:02X?}", raw);
+    if tcp_header.source_port == 9092 {
+        // dealing with a response
+        decode_kafka_response(&kafka_data);
+    } else {
+        decode_kafka_request(&kafka_data);
     }
 }
 
+fn decode_kafka_response(data: &[u8]) {
+    //let mut res = KafkaResponse::decode(&mut Bytes::from(data.to_vec()), 13).unwrap();
+    todo!()
+}
 
+fn decode_kafka_request(data: &[u8]) {
+    let req = kafka_protocol::messages::RequestHeader::decode(&mut Bytes::from(data.to_vec()), 13);
+        let api_key = ApiKey::try_from(0).unwrap();
+        match api_key {
+            ApiKey::FetchKey => {
+                // let req = kafka_protocol::messages::FetchRequest::decode(&mut, version).unwrap();
+                // for topic in &req.topics {
+                //     println!("{}", topic.topic.to_string())
+                // }
+            }
+            _ => {
+                println!("unknown one")
+            }
+        }
+}
 
 fn decode_kafka_packet(data: &[u8]) {
     let mut buf = BytesMut::from(data);
